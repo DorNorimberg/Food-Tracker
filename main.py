@@ -1,218 +1,466 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime
-import pytz
-import sqlite3
+from datetime import datetime, timedelta, date
+import json
+import os
+import io
+import math
 
 # Set page configuration
 st.set_page_config(page_title="מעקב תזונה", layout="wide", initial_sidebar_state="expanded")
 
-# Custom CSS to center text, set RTL, and style tables
+# Custom CSS to set RTL and font
 st.markdown("""
 <style>
-    .stApp {
+    @import url('https://fonts.googleapis.com/css2?family=Rubik:wght@300;400;500&display=swap');
+
+    body {
+        direction: rtl;
+        text-align: right;
+        font-family: 'Rubik', sans-serif;
+    }
+    .stButton>button {
+        float: right;
+    }
+    .stSelectbox>div>div>select {
         direction: rtl;
     }
     .stTextInput>div>div>input {
-        text-align: right;
-    }
-    .stSelectbox>div>div>div {
-        text-align: right;
-    }
-    .dataframe {
         direction: rtl;
     }
-    .dataframe th {
-        text-align: right !important;
+    .points-table {
+        position: fixed;
+        left: 10px;
+        top: 60px;
+        width: 200px;
+        background-color: white;
+        padding: 10px;
+        border-radius: 5px;
+        box-shadow: 0 0 10px rgba(0,0,0,0.1);
     }
-    .dataframe td {
-        text-align: right !important;
+    .half-width {
+        width: 50%;
     }
-    button {
-        float: right;
+    .quarter-width {
+        width: 25%;
     }
-    div[data-testid="stVerticalBlock"] {
+    .streamlit-table {
         direction: rtl;
+    }
+    .streamlit-table th {
+        text-align: right !important;
+    }
+    .streamlit-table td {
+        text-align: right !important;
+    }
+    .stDataFrame {
+        direction: rtl;
+    }
+    .stDataFrame th {
+        text-align: right !important;
+    }
+    .stDataFrame td {
+        text-align: right !important;
+    }
+    /* Ensure all tables have RTL text alignment */
+    table {
+        direction: rtl;
+    }
+    th, td {
+        text-align: right !important;
+    }
+    /* Override Streamlit's default left alignment for buttons */
+    .stButton {
+        text-align: right;
+    }
+    /* Ensure dropdowns are properly aligned */
+    .stSelectbox {
+        direction: rtl;
+        text-align: right;
+    }
+    /* Adjust input fields for RTL */
+    .stTextInput>div>div>input, .stNumberInput>div>div>input {
+        text-align: right;
+    }
+    /* Ensure date picker is RTL */
+    .stDateInput {
+        direction: rtl;
+    }
+    /* Adjust tab labels for RTL */
+    .stTabs [data-baseweb="tab-list"] {
+        direction: rtl;
+    }
+    .stTabs [data-baseweb="tab"] {
+        direction: rtl;
+        text-align: right;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# Initialize database
-conn = sqlite3.connect('food_tracker.db')
-c = conn.cursor()
+# Initialize session state
+if 'food_data' not in st.session_state:
+    st.session_state.food_data = pd.DataFrame({
+        'קטגוריה': ['שומנים', 'פחמימות', 'חלבונים', 'ירקות', 'מוצרי חלב', 'פירות'],
+        'מקסימום נקודות': [11, 24, 28, math.inf, 16, 5],
+        'שם מזון': ['', '', '', '', '', ''],
+        'נקודות למנה': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    })
+if 'consumption_history' not in st.session_state:
+    st.session_state.consumption_history = {}
 
-# Create tables if they don't exist
-c.execute('''CREATE TABLE IF NOT EXISTS categories
-             (name TEXT PRIMARY KEY, max_points INTEGER)''')
-c.execute('''CREATE TABLE IF NOT EXISTS foods
-             (name TEXT PRIMARY KEY, category TEXT, points REAL)''')
-c.execute('''CREATE TABLE IF NOT EXISTS daily_intake
-             (date TEXT, food TEXT, category TEXT, points REAL, servings REAL)''')
+if 'remaining_points' not in st.session_state:
+    st.session_state.remaining_points = {
+        'שומנים': 11,
+        'פחמימות': 24,
+        'חלבונים': 28,
+        'ירקות': math.inf,
+        'מוצרי חלב': 16,
+        'פירות': 5
+    }
 
-# Initialize categories if the table is empty
-c.execute("SELECT COUNT(*) FROM categories")
-if c.fetchone()[0] == 0:
-    categories = [
-        ("שומנים", 11),
-        ("פחמימות", 24),
-        ("חלבונים", 28),
-        ("ירקות", -1),  # -1 for unlimited
-        ("מוצרי חלב", 16),
-        ("פירות", 5)
-    ]
-    c.executemany("INSERT INTO categories VALUES (?, ?)", categories)
-    conn.commit()
+if 'last_reset_date' not in st.session_state:
+    st.session_state.last_reset_date = date.today()
 
 
-def get_remaining_points():
-    today = datetime.now(pytz.timezone('Asia/Jerusalem')).strftime('%Y-%m-%d')
-    remaining_points = {}
+# Function to save data
+def save_data():
+    st.session_state.food_data.to_csv('food_data.csv', index=False)
+    with open('consumption_history.json', 'w') as f:
+        json.dump(st.session_state.consumption_history, f)
+    with open('remaining_points.json', 'w') as f:
+        json.dump(st.session_state.remaining_points, f)
 
-    # Fetch all categories first
-    c.execute("SELECT name, max_points FROM categories")
-    all_categories = c.fetchall()
 
-    for category, max_points in all_categories:
-        c.execute("SELECT SUM(points * servings) FROM daily_intake WHERE date = ? AND category = ?", (today, category))
-        used_points = c.fetchone()[0] or 0
-        if max_points == -1:
-            remaining = "ללא הגבלה"
+# Function to load data
+def load_data():
+    if os.path.exists('food_data.csv'):
+        st.session_state.food_data = pd.read_csv('food_data.csv')
+    if os.path.exists('consumption_history.json'):
+        with open('consumption_history.json', 'r') as f:
+            st.session_state.consumption_history = json.load(f)
+    if os.path.exists('remaining_points.json'):
+        with open('remaining_points.json', 'r') as f:
+            st.session_state.remaining_points = json.load(f)
+
+
+# Load data at the start of the app
+load_data()
+
+
+# Function to format points
+def format_points(value):
+    if isinstance(value, (int, float)):
+        if math.isinf(value):
+            return "∞"
+        elif value == int(value):
+            return f"{int(value)}"
         else:
-            remaining = max_points - used_points
-        remaining_points[category] = remaining
-
-    return remaining_points
+            return f"{value:.1f}".rstrip('0').rstrip('.')
+    return value
 
 
-def add_food_item(food_name, category, points, servings):
-    today = datetime.now(pytz.timezone('Asia/Jerusalem')).strftime('%Y-%m-%d')
-    c.execute("INSERT INTO daily_intake (date, food, category, points, servings) VALUES (?, ?, ?, ?, ?)",
-              (today, food_name, category, points, servings))
-    conn.commit()
+# Function to reset points
+def reset_points():
+    today = date.today()
+    if today > st.session_state.last_reset_date:
+        st.session_state.remaining_points = {
+            'שומנים': 11,
+            'פחמימות': 24,
+            'חלבונים': 28,
+            'ירקות': math.inf,
+            'מוצרי חלב': 16,
+            'פירות': 5
+        }
+        today_str = today.strftime('%Y-%m-%d')
+        if today_str in st.session_state.consumption_history:
+            del st.session_state.consumption_history[today_str]
 
-def add_new_food_to_database(food_name, category, points):
-    c.execute("INSERT INTO foods (name, category, points) VALUES (?, ?, ?)", (food_name, category, points))
-    conn.commit()
-
-def get_daily_intake():
-    today = datetime.now(pytz.timezone('Asia/Jerusalem')).strftime('%Y-%m-%d')
-    c.execute("SELECT * FROM daily_intake WHERE date = ? ORDER BY category", (today,))
-    return c.fetchall()
-
-
-def delete_food_item(food_name, category, points, servings):
-    today = datetime.now(pytz.timezone('Asia/Jerusalem')).strftime('%Y-%m-%d')
-    c.execute("""DELETE FROM daily_intake 
-                 WHERE date = ? AND food = ? AND category = ? AND points = ? AND servings = ? 
-                 AND rowid = (SELECT rowid FROM daily_intake 
-                              WHERE date = ? AND food = ? AND category = ? AND points = ? AND servings = ? 
-                              LIMIT 1)""",
-              (today, food_name, category, points, servings, today, food_name, category, points, servings))
-    conn.commit()
+        st.session_state.last_reset_date = today
+        save_data()
 
 
-def main_page():
-    st.title("מעקב תזונה יומי")
-
-    col1, col2 = st.columns([3, 2])
-
-    with col1:
-        food_name = st.text_input("שם המזון")
-        servings = st.number_input("מספר מנות", min_value=0.1, step=0.1, value=1.0)
-
-        if st.button("הוסף מזון"):
-            c.execute("SELECT * FROM foods WHERE name = ?", (food_name,))
-            food = c.fetchone()
-
-            if food:
-                add_food_item(food[0], food[1], food[2], servings)
-                st.success(f"נוסף {servings} מנות של {food_name}")
-            else:
-                st.warning("מזון לא נמצא במסד הנתונים. אנא הוסף אותו.")
-                with st.form("add_new_food"):
-                    new_category = st.selectbox("קטגוריה", [cat[0] for cat in c.execute("SELECT name FROM categories")])
-                    new_points = st.number_input("נקודות למנה", min_value=0.1, step=0.1)
-                    if st.form_submit_button("הוסף מזון חדש"):
-                        try:
-                            add_new_food_to_database(food_name, new_category, new_points)
-                            add_food_item(food_name, new_category, new_points, servings)
-                            st.success(f"נוסף {food_name} למסד הנתונים ולצריכה היומית")
-                            st.rerun()
-                        except sqlite3.IntegrityError:
-                            st.error(f"המזון {food_name} כבר קיים במסד הנתונים.")
-
-    with col2:
-        st.subheader("נקודות נותרות לכל קטגוריה:")
-        remaining_points = get_remaining_points()
-
-        # Create a DataFrame for better display
-        df_points = pd.DataFrame(list(remaining_points.items()), columns=['קטגוריה', 'נקודות נותרות'])
-
-        # Display the DataFrame as a table
-        st.table(df_points)
-
-
-def history_page():
-    st.title("היסטוריית צריכה יומית")
-
-    daily_intake = get_daily_intake()
-    if daily_intake:
-        for index, item in enumerate(daily_intake):
-            col1, col2, col3 = st.columns([2, 1, 1])
-            with col1:
-                st.write(f"{item[1]} ({item[2]})")
-            with col2:
-                st.write(f"{item[4]} מנות")
-            with col3:
-                if st.button("מחק", key=f"delete_{item[1]}_{item[3]}_{item[4]}_{index}"):
-                    delete_food_item(*item[1:])
-                    st.rerun()
+# Function to add food consumption
+def add_food_consumption(food_name, servings, date):
+    food_item = st.session_state.food_data[st.session_state.food_data['שם מזון'] == food_name]
+    if not food_item.empty:
+        category = food_item['קטגוריה'].values[0]
+        points = food_item['נקודות למנה'].values[0] * servings
+        if date not in st.session_state.consumption_history:
+            st.session_state.consumption_history[date] = []
+        st.session_state.consumption_history[date].append({
+            'שם מזון': food_name,
+            'קטגוריה': category,
+            'מנות': servings,
+            'נקודות': points
+        })
+        if category != 'ירקות':
+            st.session_state.remaining_points[category] -= points
+        save_data()
+        st.success(f'המזון {food_name} נוסף בהצלחה')
+        st.rerun()
     else:
-        st.write("אין נתונים להיום")
+        st.error('המזון לא נמצא במאגר. אנא הוסף אותו קודם.')
+        st.session_state.show_add_new_food = True
 
 
-def database_page():
-    st.title("ניהול מסד נתונים")
+# Function to add new food to database
+def add_new_food(name, category, points):
+    if name.strip() == '':
+        st.error('שם המזון לא יכול להיות ריק')
+        return
+    if not st.session_state.food_data[(st.session_state.food_data['קטגוריה'] == category) &
+                                      (st.session_state.food_data['שם מזון'] == name)].empty:
+        st.error('המזון כבר קיים ברשימה')
+        return
+    new_food = pd.DataFrame({
+        'קטגוריה': [category],
+        'מקסימום נקודות': [
+            st.session_state.food_data[st.session_state.food_data['קטגוריה'] == category]['מקסימום נקודות'].iloc[0]],
+        'שם מזון': [name],
+        'נקודות למנה': [points]
+    })
+    st.session_state.food_data = pd.concat([st.session_state.food_data, new_food], ignore_index=True)
+    save_data()
+    st.success(f'המזון {name} נוסף בהצלחה למאגר')
 
-    tab1, tab2 = st.tabs(["מזונות", "קטגוריות"])
+
+# Function to edit food consumption
+def edit_food_consumption(date, index, new_servings):
+    food_item = st.session_state.consumption_history[date][index]
+    old_points = food_item['נקודות']
+    new_points = (new_servings * old_points) / food_item['מנות']
+
+    if food_item['קטגוריה'] != 'ירקות':
+        st.session_state.remaining_points[food_item['קטגוריה']] += old_points
+        st.session_state.remaining_points[food_item['קטגוריה']] -= new_points
+
+    st.session_state.consumption_history[date][index]['מנות'] = new_servings
+    st.session_state.consumption_history[date][index]['נקודות'] = new_points
+    save_data()
+    st.success('הצריכה עודכנה בהצלחה')
+
+
+# Function to delete food consumption
+def delete_food_consumption(date, index):
+    food_item = st.session_state.consumption_history[date][index]
+    if food_item['קטגוריה'] != 'ירקות':
+        st.session_state.remaining_points[food_item['קטגוריה']] += food_item['נקודות']
+    del st.session_state.consumption_history[date][index]
+    if not st.session_state.consumption_history[date]:
+        del st.session_state.consumption_history[date]
+    save_data()
+    st.success('הצריכה נמחקה בהצלחה')
+
+
+# Function to generate Excel report
+def generate_excel_report():
+    output = io.BytesIO()
+    writer = pd.ExcelWriter(output, engine='xlsxwriter')
+
+    # Get dates for the last week
+    end_date = datetime.now().date()
+    start_date = end_date - timedelta(days=6)
+
+    for i in range(7):
+        date = (start_date + timedelta(days=i)).strftime('%Y-%m-%d')
+        if date in st.session_state.consumption_history:
+            df = pd.DataFrame(st.session_state.consumption_history[date])
+            df.to_excel(writer, sheet_name=date, index=False)
+
+    writer.save()
+    return output.getvalue()
+
+
+# Main app
+def main():
+    reset_points()
+
+    st.title('מעקב תזונה')
+
+    tab1, tab2, tab3 = st.tabs(['צריכת מזון', 'היסטוריה', 'מאגר מזון'])
 
     with tab1:
-        st.subheader("הוסף מזון חדש")
-        with st.form("add_food"):
-            new_food = st.text_input("שם המזון")
-            new_category = st.selectbox("קטגוריה", [cat[0] for cat in c.execute("SELECT name FROM categories")])
-            new_points = st.number_input("נקודות למנה", min_value=0.1, step=0.1)
-            if st.form_submit_button("הוסף"):
-                c.execute("INSERT INTO foods VALUES (?, ?, ?)", (new_food, new_category, new_points))
-                conn.commit()
-                st.success(f"נוסף {new_food} למסד הנתונים")
+        st.header('צריכת מזון')
 
-        st.subheader("מזונות קיימים")
-        foods = pd.read_sql_query("SELECT * FROM foods", conn)
-        edited_df = st.data_editor(foods, num_rows="dynamic")
+        # Food consumption section
+        st.subheader('הוסף צריכת מזון')
+        input_col1, input_col2, input_col3, input_col4 = st.columns(4)
+        with input_col1:
+            food_name = st.text_input('שם המזון', key='food_name_input')
+        with input_col2:
+            servings = st.number_input('מספר מנות', min_value=0.1, step=0.1, value=1.0, key='servings_input')
+        with input_col3:
+            date = st.date_input('תאריך', datetime.now(), key='date_input')
 
-        if st.button("שמור שינויים"):
-            c.execute("DELETE FROM foods")
-            edited_df.to_sql("foods", conn, if_exists="replace", index=False)
-            st.success("השינויים נשמרו בהצלחה")
+        if st.button('הוסף צריכה', key='add_consumption_button'):
+            add_food_consumption(food_name, servings, date.strftime('%Y-%m-%d'))
+
+        # Add new food section
+        st.subheader('הוסף מזון חדש')
+        input_col1, input_col2, input_col3, input_col4 = st.columns(4)
+        with input_col1:
+            new_food_name = st.text_input('שם המזון החדש', key='new_food_name')
+        with input_col2:
+            new_food_category = st.selectbox('קטגוריה', st.session_state.food_data['קטגוריה'].unique(),
+                                             key='new_food_category')
+        with input_col3:
+            new_food_points = st.number_input('נקודות למנה', min_value=0.0, step=0.1, key='new_food_points')
+
+        if st.button('הוסף למאגר', key='add_new_food_button'):
+            add_new_food(new_food_name, new_food_category, new_food_points)
+
+        # Remaining points table at the bottom
+        st.subheader('נקודות נותרות')
+        points_df = pd.DataFrame(list(st.session_state.remaining_points.items()), columns=['קטגוריה', 'נקודות'])
+        points_df['נקודות'] = points_df['נקודות'].apply(format_points)
+        st.table(points_df.style.set_properties(**{'text-align': 'right'}))
 
     with tab2:
-        st.subheader("קטגוריות קיימות")
-        categories = pd.read_sql_query("SELECT * FROM categories", conn)
-        st.dataframe(categories)
+        st.header('היסטוריית צריכה')
+
+        input_col1, input_col2, input_col3, input_col4 = st.columns(4)
+        with input_col1:
+            selected_date = st.date_input('בחר תאריך', datetime.now(), key='history_date_input')
+
+        date_str = selected_date.strftime('%Y-%m-%d')
+
+        if date_str in st.session_state.consumption_history and st.session_state.consumption_history[date_str]:
+            history_data = pd.DataFrame(st.session_state.consumption_history[date_str])
+
+            if not history_data.empty:
+                edited_df = st.data_editor(
+                    history_data[['קטגוריה', 'נקודות', 'מנות', 'שם מזון']],
+                    column_config={
+                        "שם מזון": st.column_config.TextColumn("שם מזון", width="medium"),
+                        "מנות": st.column_config.NumberColumn("מנות", width="small", format="%.1f"),
+                        "נקודות": st.column_config.NumberColumn("נקודות", width="small", format="%.1f"),
+                        "קטגוריה": st.column_config.TextColumn("קטגוריה", width="medium"),
+                    },
+                    hide_index=True,
+                    num_rows="dynamic",
+                    key="history_table"
+                )
+
+                if st.button('שמור שינויים', key='save_history_changes'):
+                    # Update consumption history
+                    st.session_state.consumption_history[date_str] = edited_df.to_dict('records')
+
+                    # Update remaining points
+                    for category in st.session_state.remaining_points.keys():
+                        if category != 'ירקות':
+                            old_total = sum(item['נקודות'] for item in
+                                            history_data[history_data['קטגוריה'] == category].to_dict('records'))
+                            new_total = sum(item['נקודות'] for item in
+                                            edited_df[edited_df['קטגוריה'] == category].to_dict('records'))
+                            st.session_state.remaining_points[category] += old_total - new_total
+
+                    # Remove the date if all items are deleted
+                    if edited_df.empty:
+                        del st.session_state.consumption_history[date_str]
+
+                    save_data()
+                    st.success('השינויים נשמרו בהצלחה')
+                    st.rerun()
+            else:
+                st.warning('אין היסטוריה עבור היום הזה')
+                del st.session_state.consumption_history[date_str]
+                save_data()
+        else:
+            st.warning('אין היסטוריה עבור היום הזה')
+
+    with tab3:
+        st.header('מאגר מזון')
+
+        input_col1, input_col2, input_col3, input_col4 = st.columns(4)
+        with input_col1:
+            selected_category = st.selectbox('בחר קטגוריה', [''] + list(st.session_state.food_data['קטגוריה'].unique()))
+
+        if selected_category:
+            category_data = st.session_state.food_data[st.session_state.food_data['קטגוריה'] == selected_category]
+
+            input_col1, input_col2, input_col3, input_col4 = st.columns(4)
+            with input_col1:
+                new_food_name = st.text_input('שם המזון החדש', key='new_food_name_empty')
+            with input_col2:
+                new_food_points = st.number_input('נקודות למנה', min_value=0.0, step=0.1, key='new_food_points_empty')
+
+            if st.button('הוסף מזון חדש', key='add_new_food_empty'):
+                if new_food_name.strip() != '':
+                    new_food = pd.DataFrame({
+                        'קטגוריה': [selected_category],
+                        'מקסימום נקודות': [
+                            st.session_state.food_data[st.session_state.food_data['קטגוריה'] == selected_category][
+                                'מקסימום נקודות'].iloc[0]],
+                        'שם מזון': [new_food_name],
+                        'נקודות למנה': [new_food_points]
+                    })
+                    st.session_state.food_data = pd.concat([st.session_state.food_data, new_food], ignore_index=True)
+                    save_data()
+                    st.success(f'המזון {new_food_name} נוסף בהצלחה לקטגוריה {selected_category}')
+                    st.rerun()
+                else:
+                    st.error('שם המזון לא יכול להיות ריק')
+
+            if category_data.empty or category_data['שם מזון'].isnull().all() or (category_data['שם מזון'] == '').all():
+                st.warning('הקטגוריה ריקה')
+            else:
+                edited_df = st.data_editor(
+                    category_data[['שם מזון', 'נקודות למנה']],
+                    num_rows="dynamic",
+                    key=f"data_editor_{selected_category}",
+                    column_config={
+                        "שם מזון": st.column_config.TextColumn(
+                            "שם מזון",
+                            width="medium",
+                            required=True,
+                        ),
+                        "נקודות למנה": st.column_config.NumberColumn(
+                            "נקודות למנה",
+                            width="small",
+                            min_value=0,
+                            max_value=100,
+                            step=0.1,
+                            format="%.1f",
+                        ),
+                    },
+                )
+
+                if st.button('שמור שינויים', key='save_changes_button'):
+                    # Filter out rows with blank food names or NaN points
+                    valid_entries = edited_df[(edited_df['שם מזון'].notna()) & (edited_df['שם מזון'] != '') & (
+                        edited_df['נקודות למנה'].notna())]
+
+                    # Update the food_data DataFrame for the selected category
+                    max_points = st.session_state.food_data[st.session_state.food_data['קטגוריה'] == selected_category][
+                        'מקסימום נקודות'].iloc[0]
+                    st.session_state.food_data = st.session_state.food_data[
+                        st.session_state.food_data['קטגוריה'] != selected_category]
+
+                    if not valid_entries.empty:
+                        new_category_data = pd.DataFrame({
+                            'קטגוריה': [selected_category] * len(valid_entries),
+                            'מקסימום נקודות': [max_points] * len(valid_entries),
+                            'שם מזון': valid_entries['שם מזון'],
+                            'נקודות למנה': valid_entries['נקודות למנה']
+                        })
+                    else:
+                        new_category_data = pd.DataFrame({
+                            'קטגוריה': [selected_category],
+                            'מקסימום נקודות': [max_points],
+                            'שם מזון': [''],
+                            'נקודות למנה': [0.0]
+                        })
+
+                    st.session_state.food_data = pd.concat([st.session_state.food_data, new_category_data],
+                                                           ignore_index=True)
+
+                    save_data()
+                    st.success('השינויים נשמרו בהצלחה')
+                    st.rerun()
+        else:
+            st.write('בחר קטגוריה כדי לראות או לערוך מזונות')
 
 
-def main():
-    st.sidebar.title("ניווט")
-    page = st.sidebar.radio("עבור ל:", ["דף ראשי", "היסטוריה", "ניהול מסד נתונים"])
-
-    if page == "דף ראשי":
-        main_page()
-    elif page == "היסטוריה":
-        history_page()
-    else:
-        database_page()
-
-
+# Call the main function
 if __name__ == "__main__":
     main()
